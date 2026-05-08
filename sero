@@ -1,0 +1,1928 @@
+-- Minesweeper Solver
+-- https://roblox.com/games/7871169780/bLockermans-Minesweeper
+-- Made by whoswhip heavily modified by befia/taylor
+-- original:
+-- https://github.com/whoswhip/luascripts/blob/main/serotonin/scripts/MineSweeper.lua
+local data = {
+    cells = {
+        all = {},
+        numbered = {},
+        toFlag = {},
+        toClear = {},
+        guess = {},
+        grid = {},
+        list = {}
+    },
+    cache = {
+        xs_centers_cached = nil,
+        zs_centers_cached = nil,
+        partsFolder = nil,
+        partsCount = 0,
+        partsSig = "",
+        epoch = 0,
+        lastEpochPlanned = -1
+    },
+    grid = {w = 0, h = 0},
+    ui = {
+        PROB_FLAG_THRESHOLD = 0.70,
+        PROB_SAFE_THRESHOLD = 0.30,
+        drawNumbers = false,
+        drawFlags = true,
+        drawClears = true,
+        drawGuesses = true,
+        USE_PATTERN_LIBRARY = true
+    },
+    timing = {lastPlanTick = 0, planIntervalMs = 33},
+    debug = {
+        enabled = true,
+        frontier = 0,
+        comps = 0,
+        maxComp = 0,
+        enumerated = 0,
+        skipped = 0,
+        planMs = 0
+    }
+}
+
+-- Locals / helpers
+
+local abs, floor, huge = math.abs, math.floor, math.huge
+local min, max = math.min, math.max
+local sort = table.sort
+local tostring, tonumber, ipairs, pairs = tostring, tonumber, ipairs, pairs
+local Color3_fromRGB = Color3 and Color3.fromRGB
+
+local function isNumber(str) return tonumber(str) ~= nil end
+
+local function key(ix, iz) return tostring(ix) .. ":" .. tostring(iz) end
+
+local function clusterSorted(sorted_list, epsilon)
+    local clusters = {}
+    if #sorted_list == 0 then return clusters end
+
+    local current_center = sorted_list[1]
+    local current_count = 1
+
+    for i = 2, #sorted_list do
+        local v = sorted_list[i]
+        if abs(v - current_center) <= epsilon then
+            current_count = current_count + 1
+            current_center = current_center + (v - current_center) /
+                                 current_count
+        else
+            clusters[#clusters + 1] = current_center
+            current_center = v
+            current_count = 1
+        end
+    end
+
+    clusters[#clusters + 1] = current_center
+    return clusters
+end
+
+local function median(tbl)
+    if #tbl == 0 then return nil end
+    sort(tbl)
+    local mid = floor((#tbl + 1) / 2)
+    return tbl[mid]
+end
+
+local function typicalSpacing(sorted_centers)
+    if #sorted_centers < 2 then return 4 end
+    local diffs = {}
+    for i = 2, #sorted_centers do
+        diffs[#diffs + 1] = abs(sorted_centers[i] - sorted_centers[i - 1])
+    end
+    return median(diffs) or 4
+end
+
+local function nearestIndex(v, centers)
+    local n = #centers
+    if n == 0 then return -1 end
+
+    local lo, hi = 1, n
+    while lo <= hi do
+        local mid = floor((lo + hi) / 2)
+        local cm = centers[mid]
+        if cm == v then return mid - 1 end
+        if cm < v then
+            lo = mid + 1
+        else
+            hi = mid - 1
+        end
+    end
+
+    local bestI, bestD = 1, huge
+    local a = lo - 1
+    local b = lo
+    local c = lo + 1
+
+    if a >= 1 and a <= n then
+        local d = abs(v - centers[a])
+        if d < bestD then
+            bestD = d;
+            bestI = a
+        end
+    end
+    if b >= 1 and b <= n then
+        local d = abs(v - centers[b])
+        if d < bestD then
+            bestD = d;
+            bestI = b
+        end
+    end
+    if c >= 1 and c <= n then
+        local d = abs(v - centers[c])
+        if d < bestD then
+            bestD = d;
+            bestI = c
+        end
+    end
+
+    return bestI - 1
+end
+
+local function isCoveredCell(cell)
+    if not cell then return false end
+    if cell.state == "number" then return false end
+    return cell.covered ~= false
+end
+
+-- Colors
+
+local colors = {
+    [1] = {R = 100, G = 100, B = 255},
+    [2] = {R = 100, G = 206, B = 0},
+    [3] = {R = 238, G = 0, B = 0},
+    [4] = {R = 0, G = 0, B = 114},
+    [5] = {R = 96, G = 0, B = 0},
+    [6] = {R = 0, G = 167, B = 189},
+    [7] = {R = 17, G = 18, B = 21},
+    [8] = {R = 231, G = 234, B = 239}
+}
+
+local NUM_COLORS = {}
+for i = 1, 8 do
+    local c = colors[i]
+    if c then
+        NUM_COLORS[i] = (Color3_fromRGB and Color3_fromRGB(c.R, c.G, c.B) or
+                            Color3.fromRGB(c.R, c.G, c.B))
+    end
+end
+
+local COL_YELLOW = (Color3_fromRGB and Color3_fromRGB(255, 255, 0) or
+                       Color3.fromRGB(255, 255, 0))
+local COL_FLAG = (Color3_fromRGB and Color3_fromRGB(255, 51, 51) or
+                     Color3.fromRGB(255, 51, 51))
+local COL_CLEAR = (Color3_fromRGB and Color3_fromRGB(51, 255, 51) or
+                      Color3.fromRGB(51, 255, 51))
+local COL_GUESS_HIGH = (Color3_fromRGB and Color3_fromRGB(255, 180, 50) or
+                           Color3.fromRGB(255, 180, 50))
+local COL_GUESS_HIGH_PCT = (Color3_fromRGB and Color3_fromRGB(255, 210, 120) or
+                               Color3.fromRGB(255, 210, 120))
+local COL_GUESS_SAFE = (Color3_fromRGB and Color3_fromRGB(50, 220, 220) or
+                           Color3.fromRGB(50, 220, 220))
+local COL_GUESS_SAFE_PCT = (Color3_fromRGB and Color3_fromRGB(120, 230, 230) or
+                               Color3.fromRGB(120, 230, 230))
+local COL_GUESS_OTHER = (Color3_fromRGB and Color3_fromRGB(180, 100, 220) or
+                            Color3.fromRGB(180, 100, 220))
+local COL_GUESS_OTHER_PCT = (Color3_fromRGB and Color3_fromRGB(200, 150, 230) or
+                                Color3.fromRGB(200, 150, 230))
+
+-- UI setup
+
+ui.newTab("ms", "Minesweeper")
+ui.newContainer("ms", "settings", "Settings")
+
+ui.newCheckbox("ms", "settings", "Draw Numbers")
+ui.newCheckbox("ms", "settings", "Draw Flags")
+ui.newCheckbox("ms", "settings", "Draw Clears")
+ui.newCheckbox("ms", "settings", "Draw Guesses")
+ui.newCheckbox("ms", "settings", "Use Pattern Library")
+ui.newCheckbox("ms", "settings", "Trust External Flags")
+ui.newCheckbox("ms", "settings", "Use Global Mine Count")
+ui.newCheckbox("ms", "settings", "Debug Stats")
+
+ui.newSliderInt("ms", "settings", "Total Mines", 1, 500, 100)
+ui.newSliderInt("ms", "settings", "Flag Probability Threshold", 25, 95, 70)
+ui.newSliderInt("ms", "settings", "Safe Probability Threshold", 25, 95, 30)
+ui.newSliderInt("ms", "settings", "Exact Enum Max Size", 8, 32, 22)
+ui.newSliderInt("ms", "settings", "Exact Enum Cap", 10000, 10000000, 1000000)
+
+ui.setValue("ms", "settings", "Debug Stats", false)
+ui.setValue("ms", "settings", "Draw Numbers", true)
+ui.setValue("ms", "settings", "Draw Flags", true)
+ui.setValue("ms", "settings", "Draw Clears", true)
+ui.setValue("ms", "settings", "Draw Guesses", true)
+ui.setValue("ms", "settings", "Use Pattern Library", true)
+ui.setValue("ms", "settings", "Trust External Flags", false)
+ui.setValue("ms", "settings", "Use Global Mine Count", false)
+
+local function updateUIData()
+    data.ui.PROB_FLAG_THRESHOLD = (ui.getValue("ms", "settings",
+                                               "Flag Probability Threshold") or
+                                      70) / 100
+    data.ui.PROB_SAFE_THRESHOLD = (ui.getValue("ms", "settings",
+                                               "Safe Probability Threshold") or
+                                      30) / 100
+    data.ui.drawNumbers = ui.getValue("ms", "settings", "Draw Numbers") or false
+    data.ui.drawFlags = ui.getValue("ms", "settings", "Draw Flags") or false
+    data.ui.drawClears = ui.getValue("ms", "settings", "Draw Clears") or false
+    data.ui.drawGuesses = ui.getValue("ms", "settings", "Draw Guesses") or false
+    data.ui.USE_PATTERN_LIBRARY = ui.getValue("ms", "settings",
+                                              "Use Pattern Library") or true
+    data.debug.enabled = ui.getValue("ms", "settings", "Debug Stats") or false
+end
+
+-- Flag detection (cached child lookup)
+
+local function isPartFlaggedCached(cell, part)
+    local f = cell._flagChild
+    if f and f.Parent == part then return true end
+    cell._flagChild = nil
+
+    local c = part:FindFirstChild("Flag")
+    if c then
+        cell._flagChild = c
+        return true
+    end
+
+    local children = part:GetChildren()
+    for i = 1, #children do
+        local child = children[i]
+        local name = child and child.Name
+        if name and string.sub(name, 1, 4) == "Flag" then
+            cell._flagChild = child
+            return true
+        end
+    end
+
+    return false
+end
+
+-- Bit ops + mask helpers
+
+local has_bit32 = (type(bit32) == "table")
+local has_bit = (type(bit) == "table")
+local band, rshift, bnot, bor, lshift
+
+if has_bit32 then
+    band = bit32.band
+    rshift = bit32.rshift
+    bnot = bit32.bnot
+    bor = bit32.bor
+    lshift = bit32.lshift
+elseif has_bit then
+    band = bit.band
+    rshift = bit.rshift
+    bnot = bit.bnot
+    bor = bit.bor
+    lshift = bit.lshift
+else
+    band, rshift, bnot, bor, lshift = nil, nil, nil, nil, nil
+end
+
+local frontierMaskAll = nil
+
+local function makeBitmasks(frontierSize, membershipLists)
+    local masks = {}
+
+    if band and bor and lshift and frontierSize <= 32 then
+        frontierMaskAll = 0xFFFFFFFF
+        if frontierSize < 32 then
+            frontierMaskAll = (2 ^ frontierSize) - 1
+        end
+
+        for i = 1, #membershipLists do
+            local m = 0
+            local list = membershipLists[i]
+            for j = 1, #list do
+                local idx = list[j]
+                m = bor(m, lshift(1, idx - 1))
+            end
+            masks[i] = m
+        end
+        return masks, "num"
+
+    elseif band then
+        frontierMaskAll = nil
+        for i = 1, #membershipLists do
+            local arr = {}
+            local list = membershipLists[i]
+            for j = 1, #list do
+                local idx = list[j]
+                local c = floor((idx - 1) / 32) + 1
+                local bitpos = (idx - 1) % 32
+                arr[c] = bor(arr[c] or 0, lshift(1, bitpos))
+            end
+            masks[i] = arr
+        end
+        return masks, "chunks"
+
+    else
+        frontierMaskAll = nil
+        for i = 1, #membershipLists do
+            local s = {}
+            local list = membershipLists[i]
+            for j = 1, #list do s[list[j]] = true end
+            masks[i] = s
+        end
+        return masks, "set"
+    end
+end
+
+local function isSubsetMask(A, B, mode)
+    if mode == "num" then
+        return band(A, B) == A
+    elseif mode == "chunks" then
+        local maxn = (#A > #B) and #A or #B
+        for i = 1, maxn do
+            local av = A[i] or 0
+            local bv = B[i] or 0
+            if band(av, bv) ~= av then return false end
+        end
+        return true
+    else
+        for k, _ in pairs(A) do if not B[k] then return false end end
+        return true
+    end
+end
+
+local function diffMask(A, B, mode)
+    local out = {}
+
+    if mode == "num" then
+        local invA = bnot and band(bnot(A), frontierMaskAll or 0) or nil
+        local diff = invA and band(B, invA) or B
+        local i = 0
+
+        while diff ~= 0 do
+            if band(diff, 1) ~= 0 then
+                if not invA then
+                    if band(A, (2 ^ i)) == 0 then
+                        out[#out + 1] = i + 1
+                    end
+                else
+                    out[#out + 1] = i + 1
+                end
+            end
+            diff = rshift(diff, 1)
+            i = i + 1
+        end
+
+        return out
+
+    elseif mode == "chunks" then
+        for ci = 1, #B do
+            local bv = B[ci] or 0
+            local av = A[ci] or 0
+            local notAv = bnot and bnot(av) or (0xFFFFFFFF - av)
+            notAv = band(notAv, 0xFFFFFFFF)
+
+            local d = band(bv, notAv)
+            local base = (ci - 1) * 32
+            local k = 0
+
+            while d ~= 0 do
+                if band(d, 1) ~= 0 then
+                    out[#out + 1] = base + k + 1
+                end
+                d = rshift(d, 1)
+                k = k + 1
+            end
+        end
+
+        return out
+
+    else
+        for idx, _ in pairs(B) do
+            if not A[idx] then out[#out + 1] = idx end
+        end
+        return out
+    end
+end
+
+-- Combinatorics + enumeration cache
+
+local function nCk(n, k)
+    if k < 0 or k > n then return 0 end
+    if k == 0 or k == n then return 1 end
+    if k > n - k then k = n - k end
+
+    local res = 1.0
+    for i = 1, k do
+        res = res * (n - (k - i))
+        res = res / i
+    end
+    return res
+end
+
+local enumCache = {}
+local enumCacheOrder = {}
+local enumCacheSize = 3000
+local enumCachePtr = 1
+
+local function cachePut(key, val)
+    if not enumCache[key] then
+        local old = enumCacheOrder[enumCachePtr]
+        if old then enumCache[old] = nil end
+        enumCacheOrder[enumCachePtr] = key
+        enumCachePtr = (enumCachePtr % enumCacheSize) + 1
+    end
+    enumCache[key] = val
+end
+
+local function cacheGet(key) return enumCache[key] end
+
+local function constraintKeyForComp(constraints)
+    local parts = {}
+    for i = 1, #constraints do
+        local c = constraints[i]
+        local idxs = {unpack(c.idxs)}
+        sort(idxs)
+        parts[#parts + 1] = table.concat(idxs, ",") .. ":" .. tostring(c.rem)
+    end
+    sort(parts)
+    return table.concat(parts, "|")
+end
+
+local function enumerateComponent(compCells, constraints, solutionCap)
+    local n = #compCells
+    local countsPerVar = {}
+    for i = 1, n do countsPerVar[i] = 0 end
+
+    local total = 0
+    local minSeen, maxSeen = nil, nil
+    local pmf = {}
+    local countsPerVarPerK = {}
+    for i = 1, n do countsPerVarPerK[i] = {} end
+
+    local varConstraints = {}
+    for i = 1, n do varConstraints[i] = {} end
+    for ci = 1, #constraints do
+        local idxs = constraints[ci].idxs
+        for j = 1, #idxs do
+            local vi = idxs[j]
+            varConstraints[vi][#varConstraints[vi] + 1] = ci
+        end
+    end
+
+    local order = {}
+    for i = 1, n do order[i] = i end
+
+    local tightness = {}
+    for i = 1, n do
+        local minT = huge
+        for _, ci in ipairs(varConstraints[i]) do
+            local c = constraints[ci]
+            local nIdxs = #c.idxs
+            local t = min(c.rem, nIdxs - c.rem)
+            if t < minT then minT = t end
+        end
+        tightness[i] = (#varConstraints[i] > 0) and minT or huge
+    end
+
+    sort(order, function(a, b)
+        local na, nb = #varConstraints[a], #varConstraints[b]
+        if na ~= nb then return na > nb end
+        return tightness[a] < tightness[b]
+    end)
+
+    local curAssigned = {}
+    local curUnassigned = {}
+    for ci = 1, #constraints do
+        curAssigned[ci] = 0
+        curUnassigned[ci] = #constraints[ci].idxs
+    end
+
+    local assignment = {}
+    for i = 1, n do assignment[i] = 0 end
+    local stop = false
+    local capped = false
+
+    local function recurse(depth, curMines)
+        if stop then return end
+
+        if depth > n then
+            total = total + 1
+            pmf[curMines] = (pmf[curMines] or 0) + 1
+            if not minSeen or curMines < minSeen then
+                minSeen = curMines
+            end
+            if not maxSeen or curMines > maxSeen then
+                maxSeen = curMines
+            end
+
+            for i = 1, n do
+                if assignment[i] == 1 then
+                    countsPerVar[i] = countsPerVar[i] + 1
+                    local arr = countsPerVarPerK[i]
+                    arr[curMines] = (arr[curMines] or 0) + 1
+                end
+            end
+
+            if solutionCap and total >= solutionCap then stop = true end
+            if solutionCap and total >= solutionCap then
+                capped = true
+            end
+            return
+        end
+
+        local var = order[depth]
+        local vcons = varConstraints[var]
+
+        local ok0 = true
+        for i = 1, #vcons do
+            local ci = vcons[i]
+            curUnassigned[ci] = curUnassigned[ci] - 1
+            local rem = constraints[ci].rem
+            if curAssigned[ci] > rem or (curAssigned[ci] + curUnassigned[ci]) <
+                rem then ok0 = false end
+        end
+        if ok0 then
+            assignment[var] = 0
+            recurse(depth + 1, curMines)
+        end
+        for i = 1, #vcons do
+            local ci = vcons[i]
+            curUnassigned[ci] = curUnassigned[ci] + 1
+        end
+        if stop then return end
+
+        local ok1 = true
+        for i = 1, #vcons do
+            local ci = vcons[i]
+            curUnassigned[ci] = curUnassigned[ci] - 1
+            curAssigned[ci] = curAssigned[ci] + 1
+            local rem = constraints[ci].rem
+            if curAssigned[ci] > rem or (curAssigned[ci] + curUnassigned[ci]) <
+                rem then ok1 = false end
+        end
+        if ok1 then
+            assignment[var] = 1
+            recurse(depth + 1, curMines + 1)
+        end
+        for i = 1, #vcons do
+            local ci = vcons[i]
+            curUnassigned[ci] = curUnassigned[ci] + 1
+            curAssigned[ci] = curAssigned[ci] - 1
+        end
+        assignment[var] = 0
+    end
+
+    recurse(1, 0)
+    pmf[0] = pmf[0] or 0
+    for k = 1, n do pmf[k] = pmf[k] or 0 end
+
+    return total, countsPerVar, (minSeen or 0), (maxSeen or 0), pmf,
+           countsPerVarPerK, capped
+end
+
+local function enumerateComponentCached(compCells, constraints, solutionCap)
+    local key = constraintKeyForComp(constraints) .. ";" .. tostring(#compCells)
+    local cached = cacheGet(key)
+    if cached then
+        return cached.total, cached.countsPerVar, cached.minM, cached.maxM,
+               cached.pmf, cached.countsPerVarPerK, true, false
+    end
+
+    local total, countsPerVar, minM, maxM, pmf, countsPerVarPerK, capped =
+        enumerateComponent(compCells, constraints, solutionCap)
+
+    if total and total > 0 and not capped then
+        cachePut(key, {
+            total = total,
+            countsPerVar = countsPerVar,
+            minM = minM,
+            maxM = maxM,
+            pmf = pmf,
+            countsPerVarPerK = countsPerVarPerK
+        })
+    end
+
+    return total, countsPerVar, minM, maxM, pmf, countsPerVarPerK, false, capped
+end
+
+-- Reusable buffers + neighbor scan
+
+tmpUnknowns = {}
+
+getUnknownsInto = function(c, knownFlag, knownClear, out, trustExternal)
+    local nbs = c.neigh
+    local flaggedCount = 0
+    local n = 0
+
+    for i = 1, #nbs do
+        local nb = nbs[i]
+        if knownFlag[nb] or (trustExternal and nb.externalFlag) then
+            flaggedCount = flaggedCount + 1
+        elseif (not knownClear[nb]) and isCoveredCell(nb) then
+            n = n + 1
+            out[n] = nb
+        end
+    end
+
+    for i = n + 1, #out do out[i] = nil end
+    return n, flaggedCount
+end
+
+-- Inference (pattern + local joint)
+
+local tmpMarkA = {}
+local tmpMarkI = {}
+
+local function applyPatternInference(knownFlag, knownClear, trustExternal)
+    local anyChanged = false
+
+    for pass = 1, 12 do
+        local changed = false
+
+        local numberedMeta = {}
+        local membershipLists = {}
+
+        for i = 1, #data.cells.numbered do
+            local numCell = data.cells.numbered[i]
+            local nUnknowns, flaggedCount =
+                getUnknownsInto(numCell, knownFlag, knownClear, tmpUnknowns,
+                                trustExternal)
+            local rem = (numCell.number or 0) - flaggedCount
+
+            if rem >= 0 and nUnknowns > 0 then
+                local unknownsCopy = {}
+                for j = 1, nUnknowns do
+                    unknownsCopy[j] = tmpUnknowns[j]
+                end
+                numberedMeta[#numberedMeta + 1] = {
+                    unknowns = unknownsCopy,
+                    rem = rem
+                }
+                membershipLists[#membershipLists + 1] = unknownsCopy
+            end
+        end
+
+        if #numberedMeta == 0 then break end
+
+        local frontierIndex = {}
+        local frontierList = {}
+        local idx = 1
+
+        for i = 1, #membershipLists do
+            local list = membershipLists[i]
+            for j = 1, #list do
+                local c = list[j]
+                if not frontierIndex[c] then
+                    frontierIndex[c] = idx
+                    frontierList[idx] = c
+                    idx = idx + 1
+                end
+            end
+        end
+
+        local membershipIdxLists = {}
+        for i = 1, #numberedMeta do
+            local list = numberedMeta[i].unknowns
+            local arr = {}
+            for j = 1, #list do
+                arr[#arr + 1] = frontierIndex[list[j]]
+            end
+            membershipIdxLists[i] = arr
+        end
+
+        local masks, maskMode = makeBitmasks(#frontierList, membershipIdxLists)
+
+        for i = 1, #numberedMeta do
+            local A = numberedMeta[i]
+            local Ai = masks[i]
+            local sizeA = #A.unknowns
+
+            for j = 1, #numberedMeta do
+                if i ~= j then
+                    local B = numberedMeta[j]
+                    if sizeA <= #B.unknowns then
+                        local Bj = masks[j]
+                        if isSubsetMask(Ai, Bj, maskMode) then
+                            local diffIdxs = diffMask(Ai, Bj, maskMode)
+                            if #diffIdxs > 0 then
+                                local diffMines = B.rem - A.rem
+
+                                if diffMines == 0 then
+                                    for d = 1, #diffIdxs do
+                                        local c = frontierList[diffIdxs[d]]
+                                        if c and not knownClear[c] then
+                                            knownClear[c] = true
+                                            data.cells.toClear[c] = true
+                                            changed = true
+                                        end
+                                    end
+                                elseif diffMines == #diffIdxs and diffMines > 0 then
+                                    for d = 1, #diffIdxs do
+                                        local c = frontierList[diffIdxs[d]]
+                                        if c and not knownFlag[c] then
+                                            knownFlag[c] = true
+                                            data.cells.toFlag[c] = true
+                                            changed = true
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        for i = 1, #numberedMeta - 1 do
+            local A = numberedMeta[i].unknowns
+            local remA = numberedMeta[i].rem
+
+            for a = 1, #A do tmpMarkA[A[a]] = true end
+
+            for j = i + 1, #numberedMeta do
+                local B = numberedMeta[j].unknowns
+                local remB = numberedMeta[j].rem
+
+                local inter, onlyA, onlyB = {}, {}, {}
+
+                for b = 1, #B do
+                    local cell = B[b]
+                    if tmpMarkA[cell] then
+                        inter[#inter + 1] = cell
+                        tmpMarkI[cell] = true
+                    else
+                        onlyB[#onlyB + 1] = cell
+                    end
+                end
+
+                for a = 1, #A do
+                    local cell = A[a]
+                    if not tmpMarkI[cell] then
+                        onlyA[#onlyA + 1] = cell
+                    end
+                end
+
+                for t = 1, #inter do tmpMarkI[inter[t]] = nil end
+
+                local nI = #inter
+                local nA = #onlyA
+                local nB = #onlyB
+
+                if nI > 0 or nA > 0 or nB > 0 then
+                    local iMin = max(0, remA - nA, remB - nB)
+                    local iMax = min(nI, remA, remB)
+
+                    if iMin <= iMax then
+                        local cMin = max(0, remA - iMax)
+                        local cMax = min(nA, remA - iMin)
+                        local dMin = max(0, remB - iMax)
+                        local dMax = min(nB, remB - iMin)
+
+                        if cMax == 0 and nA > 0 then
+                            for x = 1, nA do
+                                local cell = onlyA[x]
+                                if not knownClear[cell] then
+                                    knownClear[cell] = true
+                                    data.cells.toClear[cell] = true
+                                    changed = true
+                                end
+                            end
+                        elseif cMin == nA and nA > 0 then
+                            for x = 1, nA do
+                                local cell = onlyA[x]
+                                if not knownFlag[cell] then
+                                    knownFlag[cell] = true
+                                    data.cells.toFlag[cell] = true
+                                    changed = true
+                                end
+                            end
+                        end
+
+                        if dMax == 0 and nB > 0 then
+                            for x = 1, nB do
+                                local cell = onlyB[x]
+                                if not knownClear[cell] then
+                                    knownClear[cell] = true
+                                    data.cells.toClear[cell] = true
+                                    changed = true
+                                end
+                            end
+                        elseif dMin == nB and nB > 0 then
+                            for x = 1, nB do
+                                local cell = onlyB[x]
+                                if not knownFlag[cell] then
+                                    knownFlag[cell] = true
+                                    data.cells.toFlag[cell] = true
+                                    changed = true
+                                end
+                            end
+                        end
+
+                        if iMax == 0 and nI > 0 then
+                            for x = 1, nI do
+                                local cell = inter[x]
+                                if not knownClear[cell] then
+                                    knownClear[cell] = true
+                                    data.cells.toClear[cell] = true
+                                    changed = true
+                                end
+                            end
+                        elseif iMin == nI and nI > 0 then
+                            for x = 1, nI do
+                                local cell = inter[x]
+                                if not knownFlag[cell] then
+                                    knownFlag[cell] = true
+                                    data.cells.toFlag[cell] = true
+                                    changed = true
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            for a = 1, #A do tmpMarkA[A[a]] = nil end
+        end
+
+        if not changed then break end
+        anyChanged = true
+    end
+
+    return anyChanged
+end
+
+local function applyLocalJointSolver(knownFlag, knownClear, trustExternal)
+    local anyChanged = false
+    local maxLocalSize = 12
+
+    local numData = {}
+    for i = 1, #data.cells.numbered do
+        local numCell = data.cells.numbered[i]
+        local nUnk, fc = getUnknownsInto(numCell, knownFlag, knownClear,
+                                         tmpUnknowns, trustExternal)
+        local rem = (numCell.number or 0) - fc
+        if rem >= 0 and nUnk > 0 then
+            local unks = {}
+            for j = 1, nUnk do unks[j] = tmpUnknowns[j] end
+            numData[#numData + 1] = {unknowns = unks, rem = rem}
+        end
+    end
+
+    if #numData < 2 then return false end
+
+    local cellToConst = {}
+    for ci = 1, #numData do
+        for _, cell in ipairs(numData[ci].unknowns) do
+            if not cellToConst[cell] then cellToConst[cell] = {} end
+            local list = cellToConst[cell]
+            list[#list + 1] = ci
+        end
+    end
+
+    local nbSets = {}
+    for ci = 1, #numData do
+        local nbSet = {}
+        for _, cell in ipairs(numData[ci].unknowns) do
+            local clist = cellToConst[cell]
+            if clist then
+                for _, cj in ipairs(clist) do
+                    if cj ~= ci then nbSet[cj] = true end
+                end
+            end
+        end
+        nbSets[ci] = nbSet
+    end
+
+    local solved = {}
+    for ci = 1, #numData do
+        local group = {ci}
+        local inGroup = {[ci] = true}
+        local unionSet = {}
+        local unionList = {}
+
+        for _, cell in ipairs(numData[ci].unknowns) do
+            unionSet[cell] = true
+            unionList[#unionList + 1] = cell
+        end
+
+        local candidates = {}
+        for nb, _ in pairs(nbSets[ci]) do
+            candidates[#candidates + 1] = nb
+        end
+
+        sort(candidates, function(a, b)
+            local newA, newB = 0, 0
+            for _, cell in ipairs(numData[a].unknowns) do
+                if not unionSet[cell] then newA = newA + 1 end
+            end
+            for _, cell in ipairs(numData[b].unknowns) do
+                if not unionSet[cell] then newB = newB + 1 end
+            end
+            return newA < newB
+        end)
+
+        for _, nb in ipairs(candidates) do
+            if not inGroup[nb] then
+                local newCells = 0
+                for _, cell in ipairs(numData[nb].unknowns) do
+                    if not unionSet[cell] then
+                        newCells = newCells + 1
+                    end
+                end
+
+                if #unionList + newCells <= maxLocalSize then
+                    group[#group + 1] = nb
+                    inGroup[nb] = true
+
+                    for _, cell in ipairs(numData[nb].unknowns) do
+                        if not unionSet[cell] then
+                            unionSet[cell] = true
+                            unionList[#unionList + 1] = cell
+                        end
+                    end
+
+                    for nb2, _ in pairs(nbSets[nb]) do
+                        if not inGroup[nb2] then
+                            local nc2 = 0
+                            for _, cell in ipairs(numData[nb2].unknowns) do
+                                if not unionSet[cell] then
+                                    nc2 = nc2 + 1
+                                end
+                            end
+
+                            if #unionList + nc2 <= maxLocalSize then
+                                group[#group + 1] = nb2
+                                inGroup[nb2] = true
+                                for _, cell in ipairs(numData[nb2].unknowns) do
+                                    if not unionSet[cell] then
+                                        unionSet[cell] = true
+                                        unionList[#unionList + 1] = cell
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        if #group >= 2 and #unionList >= 2 then
+            sort(group)
+            local gkey = table.concat(group, ",")
+            if not solved[gkey] then
+                solved[gkey] = true
+
+                local localIdOf = {}
+                for idx, c in ipairs(unionList) do
+                    localIdOf[c] = idx
+                end
+
+                local cons = {}
+                for _, gi in ipairs(group) do
+                    local cd = numData[gi]
+                    local idxs = {}
+                    for _, cell in ipairs(cd.unknowns) do
+                        idxs[#idxs + 1] = localIdOf[cell]
+                    end
+                    cons[#cons + 1] = {idxs = idxs, rem = cd.rem}
+                end
+
+                local total, counts, _, _, _, _, capped = enumerateComponent(
+                                                              unionList, cons,
+                                                              50000)
+                if total and total > 0 and not capped then
+                    for idx = 1, #unionList do
+                        local cell = unionList[idx]
+                        if counts[idx] == 0 then
+                            if not knownClear[cell] then
+                                knownClear[cell] = true
+                                data.cells.toClear[cell] = true
+                                anyChanged = true
+                            end
+                        elseif counts[idx] == total then
+                            if not knownFlag[cell] then
+                                knownFlag[cell] = true
+                                data.cells.toFlag[cell] = true
+                                anyChanged = true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return anyChanged
+end
+
+-- Grid build + state refresh
+
+local function initGridIfNeeded()
+    if data.cache.xs_centers_cached and data.cache.zs_centers_cached and
+        data.grid.w > 0 and data.grid.h > 0 and data.cells.grid and
+        next(data.cells.all) ~= nil then return true end
+
+    data.cells.all = {}
+    data.cells.numbered = {}
+    data.cells.grid = {}
+    data.cells.list = {}
+
+    local root = game.Workspace:FindFirstChild("Flag")
+    if not root then return false end
+    local partsFolder = root:FindFirstChild("Parts")
+    if not partsFolder then return false end
+
+    local parts = partsFolder:GetChildren()
+    local raw = {}
+    local sumY, countY = 0, 0
+
+    for _, part in pairs(parts) do
+        local pos = part and part.Position
+        if pos then
+            raw[#raw + 1] = {part = part, pos = pos}
+            sumY = sumY + pos.Y
+            countY = countY + 1
+        end
+    end
+
+    local centersX, centersZ = {}, {}
+    for i = 1, #raw do
+        centersX[#centersX + 1] = raw[i].pos.X
+        centersZ[#centersZ + 1] = raw[i].pos.Z
+    end
+
+    sort(centersX)
+    sort(centersZ)
+
+    local typicalWX = typicalSpacing(centersX)
+    local typicalWZ = typicalSpacing(centersZ)
+    local epsX = typicalWX * 0.6
+    local epsZ = typicalWZ * 0.6
+
+    data.cache.xs_centers_cached = clusterSorted(centersX, epsX)
+    data.cache.zs_centers_cached = clusterSorted(centersZ, epsZ)
+    data.grid.w = #data.cache.xs_centers_cached
+    data.grid.h = #data.cache.zs_centers_cached
+
+    local planeY = (countY > 0) and (sumY / countY) or 0
+
+    for iz = 0, data.grid.h - 1 do
+        for ix = 0, data.grid.w - 1 do
+            local k = key(ix, iz)
+            local row = data.cells.grid[ix]
+            if not row then
+                row = {};
+                data.cells.grid[ix] = row
+            end
+
+            local cell = {
+                ix = ix,
+                iz = iz,
+                part = nil,
+                pos = Vector3.new(data.cache.xs_centers_cached[ix + 1] or 0,
+                                  planeY,
+                                  data.cache.zs_centers_cached[iz + 1] or 0),
+                state = "unknown",
+                number = nil,
+                k = k,
+                covered = true,
+                neigh = nil,
+                externalFlag = false,
+                rgb = 0,
+                _sig = -1
+            }
+
+            data.cells.all[k] = cell
+            row[iz] = cell
+            data.cells.list[#data.cells.list + 1] = cell
+        end
+    end
+
+    for i = 1, #raw do
+        local part = raw[i].part
+        local pos = raw[i].pos
+        local ix = nearestIndex(pos.X, data.cache.xs_centers_cached)
+        local iz = nearestIndex(pos.Z, data.cache.zs_centers_cached)
+
+        if ix >= 0 and ix < data.grid.w and iz >= 0 and iz < data.grid.h then
+            local cell = data.cells.grid[ix][iz]
+            if cell and not cell.part then
+                cell.part = part
+                cell.pos = pos
+            end
+        end
+    end
+
+    for iz = 0, data.grid.h - 1 do
+        for ix = 0, data.grid.w - 1 do
+            local c = data.cells.grid[ix][iz]
+            local neigh = {}
+
+            for dz = -1, 1 do
+                for dx = -1, 1 do
+                    if not (dx == 0 and dz == 0) then
+                        local jx, jz = ix + dx, iz + dz
+                        if jx >= 0 and jx < data.grid.w and jz >= 0 and jz <
+                            data.grid.h then
+                            neigh[#neigh + 1] = data.cells.grid[jx][jz]
+                        end
+                    end
+                end
+            end
+
+            c.neigh = neigh
+        end
+    end
+
+    return true
+end
+
+local function refreshGridState()
+    data.cells.numbered = {}
+    local trustExternal =
+        ui.getValue("ms", "settings", "Trust External Flags") or false
+
+    local changed = false
+    local list = data.cells.list
+
+    for i = 1, #list do
+        local cell = list[i]
+        local part = cell.part
+
+        if part then
+            local prevSig = cell._sig or -1
+
+            cell.state = "unknown"
+            cell.covered = true
+
+            local color = part.Color
+            local r, g, b, skipTile
+            if color then
+                r = color.R;
+                g = color.G;
+                b = color.B
+                if r <= 1 then r = floor(r * 255 + 0.5) end
+                if g <= 1 then g = floor(g * 255 + 0.5) end
+                if b <= 1 then b = floor(b * 255 + 0.5) end
+                cell.rgb = r * 65536 + g * 256 + b
+                -- *** PATCH: also skip parts with color 105,105,105 ***
+                skipTile = (r == 225 and g == 225 and b == 225)
+                        or (r == 105 and g == 105 and b == 105)
+                -- Multi-theme unrevealed tile colors: keep covered = true
+                -- Theme A:  172,88,88  (normal)  |  114,62,62  (darker/shadow)
+                -- Theme B:  205,100,100 (normal) |  180,88,88 (darker/shadow)
+                local isUnrevealedColor =
+                    (r == 172 and g == 88  and b == 88)  or
+                    (r == 114 and g == 62  and b == 62)  or
+                    (r == 205 and g == 100 and b == 100) or
+                    (r == 180 and g == 88  and b == 88)
+                if skipTile then
+                    cell.covered = false -- mark as non-mine so solver skips it entirely
+                elseif isUnrevealedColor then
+                    cell.covered = true  -- explicitly unrevealed tile (multi-theme support)
+                elseif (r == 255 and g == 255 and b == 125) or (r == 200 and g == 200 and b == 200) then
+                    cell.covered = false
+                end
+            end
+
+            if not skipTile and not isUnrevealedColor and ((cell.number == nil) or (cell.covered == false)) then
+                local ngui = part:FindFirstChild("NumberGui")
+                if ngui then
+                    local textLabel = ngui:FindFirstChild("TextLabel")
+                    local v = textLabel and textLabel.Value
+                    if v and isNumber(v) then
+                        cell.number = tonumber(v)
+                        cell.covered = false
+                    end
+                end
+            end
+
+            cell.externalFlag = trustExternal and
+                                    isPartFlaggedCached(cell, part) or false
+
+            if cell.number and (cell.covered == false) then
+                cell.state = "number"
+                data.cells.numbered[#data.cells.numbered + 1] = cell
+            end
+
+            local num = cell.number or 0
+            local sig = (cell.covered and 1 or 0) +
+                            (cell.externalFlag and 2 or 0) + (num * 4)
+            if sig ~= prevSig then
+                cell._sig = sig
+                changed = true
+            end
+        end
+    end
+
+    if changed then data.cache.epoch = (data.cache.epoch or 0) + 1 end
+end
+
+-- Deterministic propagation
+
+local function propagateDeterministicQueue(knownFlag, knownClear, trustExternal)
+    local q, qh = {}, 1
+    local inQ = {}
+
+    for i = 1, #data.cells.numbered do
+        local c = data.cells.numbered[i]
+        q[#q + 1] = c
+        inQ[c] = true
+    end
+
+    local any = false
+
+    while qh <= #q do
+        local cell = q[qh]
+        qh = qh + 1
+        inQ[cell] = nil
+
+        local nUnknowns, flaggedCount = getUnknownsInto(cell, knownFlag,
+                                                        knownClear, tmpUnknowns,
+                                                        trustExternal)
+        if nUnknowns > 0 then
+            local remaining = (cell.number or 0) - flaggedCount
+
+            if remaining == 0 then
+                for u = 1, nUnknowns do
+                    local c = tmpUnknowns[u]
+                    if not knownClear[c] then
+                        knownClear[c] = true
+                        data.cells.toClear[c] = true
+                        any = true
+
+                        local nbs = c.neigh
+                        for j = 1, #nbs do
+                            local nb = nbs[j]
+                            if nb.state == "number" and not inQ[nb] then
+                                inQ[nb] = true
+                                q[#q + 1] = nb
+                            end
+                        end
+                    end
+                end
+
+            elseif remaining == nUnknowns and remaining > 0 then
+                for u = 1, nUnknowns do
+                    local c = tmpUnknowns[u]
+                    if not knownFlag[c] then
+                        knownFlag[c] = true
+                        data.cells.toFlag[c] = true
+                        any = true
+
+                        local nbs = c.neigh
+                        for j = 1, #nbs do
+                            local nb = nbs[j]
+                            if nb.state == "number" and not inQ[nb] then
+                                inQ[nb] = true
+                                q[#q + 1] = nb
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return any
+end
+
+-- Planning
+
+local function planMove()
+    if not data.cache.xs_centers_cached or not data.cache.zs_centers_cached or
+        data.grid.w == 0 or data.grid.h == 0 then return end
+    if #data.cells.numbered == 0 then
+        data.cells.toFlag = {}
+        data.cells.toClear = {}
+        data.cells.guess = {}
+        return
+    end
+
+    local t0 = (utility and utility.GetTickCount and utility.GetTickCount()) or
+                   0
+
+    local usePattern = ui.getValue("ms", "settings", "Use Pattern Library") and
+                           true or false
+    local trustExternal =
+        ui.getValue("ms", "settings", "Trust External Flags") and true or false
+    local useGlobalMineCount = ui.getValue("ms", "settings",
+                                           "Use Global Mine Count") and true or
+                                   false
+    local totalMines = ui.getValue("ms", "settings", "Total Mines") or 0
+    local enumMax = ui.getValue("ms", "settings", "Exact Enum Max Size") or 16
+    local solutionCap = ui.getValue("ms", "settings", "Exact Enum Cap") or
+                            200000
+
+    data.cells.toFlag = {}
+    data.cells.toClear = {}
+    data.cells.guess = {}
+
+    local knownFlag = {}
+    local knownClear = {}
+
+    propagateDeterministicQueue(knownFlag, knownClear, trustExternal)
+
+    if usePattern then
+        if applyPatternInference(knownFlag, knownClear, trustExternal) then
+            propagateDeterministicQueue(knownFlag, knownClear, trustExternal)
+        end
+    end
+
+    local hasForced = (next(data.cells.toFlag) ~= nil) or
+                          (next(data.cells.toClear) ~= nil)
+    if not hasForced then
+        if applyLocalJointSolver(knownFlag, knownClear, trustExternal) then
+            propagateDeterministicQueue(knownFlag, knownClear, trustExternal)
+        end
+    end
+
+    local frontierSet = {}
+    local frontierList = {}
+
+    for i = 1, #data.cells.numbered do
+        local numCell = data.cells.numbered[i]
+        local nUnknowns = getUnknownsInto(numCell, knownFlag, knownClear,
+                                          tmpUnknowns, trustExternal)
+        for u = 1, nUnknowns do
+            local c = tmpUnknowns[u]
+            if not frontierSet[c] then
+                frontierSet[c] = true
+                frontierList[#frontierList + 1] = c
+            end
+        end
+    end
+
+    local idOf = {}
+    for i = 1, #frontierList do idOf[frontierList[i]] = i end
+
+    local constraintByNum = {}
+    for i = 1, #data.cells.numbered do
+        local numCell = data.cells.numbered[i]
+        local nUnknowns, flaggedCount = getUnknownsInto(numCell, knownFlag,
+                                                        knownClear, tmpUnknowns,
+                                                        trustExternal)
+        local rem = (numCell.number or 0) - flaggedCount
+
+        if rem >= 0 and nUnknowns > 0 then
+            local included = {}
+            for u = 1, nUnknowns do
+                included[#included + 1] = idOf[tmpUnknowns[u]]
+            end
+            if #included > 0 then
+                constraintByNum[#constraintByNum + 1] = {
+                    idxs = included,
+                    rem = rem
+                }
+            end
+        end
+    end
+
+    local parent, rank = {}, {}
+    for i = 1, #frontierList do
+        parent[i] = i
+        rank[i] = 0
+    end
+
+    local function findp(x)
+        while parent[x] ~= x do
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        end
+        return x
+    end
+
+    local function union(a, b)
+        local ra, rb = findp(a), findp(b)
+        if ra == rb then return end
+        if rank[ra] < rank[rb] then
+            parent[ra] = rb
+        elseif rank[ra] > rank[rb] then
+            parent[rb] = ra
+        else
+            parent[rb] = ra
+            rank[ra] = rank[ra] + 1
+        end
+    end
+
+    for c = 1, #constraintByNum do
+        local idxs = constraintByNum[c].idxs
+        local first = idxs[1]
+        for j = 2, #idxs do union(first, idxs[j]) end
+    end
+
+    local compsByRoot = {}
+    for i = 1, #frontierList do
+        local r = findp(i)
+        local comp = compsByRoot[r]
+        if not comp then
+            comp = {}
+            compsByRoot[r] = comp
+        end
+        comp[#comp + 1] = i
+    end
+
+    local components = {}
+    for _, comp in pairs(compsByRoot) do components[#components + 1] = comp end
+
+    local compInfo = {}
+    for ci = 1, #components do
+        local comp = components[ci]
+        local compSize = #comp
+
+        local compCells = {}
+        for i = 1, compSize do compCells[i] = frontierList[comp[i]] end
+
+        local compMap = {}
+        for i = 1, compSize do compMap[comp[i]] = i end
+
+        local cons = {}
+        for k = 1, #constraintByNum do
+            local c = constraintByNum[k]
+            local localIdxs = {}
+            for j = 1, #c.idxs do
+                local g = c.idxs[j]
+                local l = compMap[g]
+                if l then localIdxs[#localIdxs + 1] = l end
+            end
+            if #localIdxs > 0 then
+                cons[#cons + 1] = {idxs = localIdxs, rem = c.rem}
+            end
+        end
+
+        local aggressiveEnum = (compSize <= (enumMax + 6) and #cons <=
+                                   (enumMax + 8))
+        if (compSize <= enumMax or aggressiveEnum) and #cons > 0 then
+            if data.debug then
+                data.debug.enumerated = data.debug.enumerated + 1
+            end
+
+            local total, countsPerVar, minM, maxM, pmf, countsPerVarPerK, _,
+                  capped =
+                enumerateComponentCached(compCells, cons, solutionCap)
+
+            if total and total > 0 and not capped then
+                compInfo[#compInfo + 1] = {
+                    cells = compCells,
+                    minM = minM,
+                    maxM = maxM,
+                    total = total,
+                    pmf = pmf,
+                    countsPerVarPerK = countsPerVarPerK
+                }
+
+                for i = 1, #compCells do
+                    data.cells.guess[compCells[i]] = countsPerVar[i] / total
+                end
+            else
+                compInfo[#compInfo + 1] = {
+                    cells = compCells,
+                    minM = 0,
+                    maxM = compSize,
+                    total = 0,
+                    pmf = nil,
+                    countsPerVarPerK = nil
+                }
+            end
+        else
+            if data.debug then
+                data.debug.skipped = data.debug.skipped + 1
+            end
+            compInfo[#compInfo + 1] = {
+                cells = compCells,
+                minM = 0,
+                maxM = compSize,
+                total = 0,
+                pmf = nil,
+                countsPerVarPerK = nil
+            }
+        end
+    end
+
+    local allEnumerated = true
+    for i = 1, #compInfo do
+        if not compInfo[i].pmf then
+            allEnumerated = false
+            break
+        end
+    end
+
+    if useGlobalMineCount and allEnumerated and totalMines and totalMines > 0 then
+        local knownFlagsCount = 0
+        for cell, _ in pairs(knownFlag) do
+            knownFlagsCount = knownFlagsCount + 1
+        end
+
+        if trustExternal then
+            for _, c in pairs(data.cells.all) do
+                if c.externalFlag and (not knownFlag[c]) then
+                    knownFlagsCount = knownFlagsCount + 1
+                end
+            end
+        end
+
+        local remainingMines = totalMines - knownFlagsCount
+        if remainingMines < 0 then remainingMines = 0 end
+
+        local outsideCovered = 0
+        for _, c in pairs(data.cells.all) do
+            if isCoveredCell(c) and (not frontierSet[c]) and (not knownFlag[c]) and
+                (not knownClear[c]) and (not (trustExternal and c.externalFlag)) then
+                outsideCovered = outsideCovered + 1
+            end
+        end
+
+        local combOutside = {}
+        for t = 0, outsideCovered do
+            combOutside[t] = nCk(outsideCovered, t)
+        end
+
+        local dp = {[0] = 1.0}
+        local numComps = #compInfo
+
+        for i = 1, numComps do
+            local c = compInfo[i]
+            local newdp = {}
+            for kPrev, waysPrev in pairs(dp) do
+                for kThis = 0, #c.pmf do
+                    local waysThis = c.pmf[kThis] or 0
+                    if waysThis > 0 then
+                        newdp[kPrev + kThis] =
+                            (newdp[kPrev + kThis] or 0) + waysPrev * waysThis
+                    end
+                end
+            end
+            dp = newdp
+        end
+
+        local totalGlobalWays = 0.0
+        for x, ways in pairs(dp) do
+            local t = remainingMines - x
+            if t >= 0 and t <= outsideCovered then
+                totalGlobalWays = totalGlobalWays + ways * combOutside[t]
+            end
+        end
+
+        if totalGlobalWays > 0 then
+            local prefix = {}
+            prefix[0] = {[0] = 1.0}
+
+            for i = 1, numComps do
+                local prev = prefix[i - 1]
+                local cur = {}
+                local ciInfo = compInfo[i]
+
+                for kPrev, waysPrev in pairs(prev) do
+                    for kThis = 0, #ciInfo.pmf do
+                        local waysThis = ciInfo.pmf[kThis] or 0
+                        if waysThis > 0 then
+                            cur[kPrev + kThis] =
+                                (cur[kPrev + kThis] or 0) + waysPrev * waysThis
+                        end
+                    end
+                end
+
+                prefix[i] = cur
+            end
+
+            local suffix = {}
+            suffix[numComps + 1] = {[0] = 1.0}
+
+            for i = numComps, 1, -1 do
+                local next = suffix[i + 1]
+                local cur = {}
+                local ciInfo = compInfo[i]
+
+                for kNext, waysNext in pairs(next) do
+                    for kThis = 0, #ciInfo.pmf do
+                        local waysThis = ciInfo.pmf[kThis] or 0
+                        if waysThis > 0 then
+                            cur[kNext + kThis] =
+                                (cur[kNext + kThis] or 0) + waysNext * waysThis
+                        end
+                    end
+                end
+
+                suffix[i] = cur
+            end
+
+            for i = 1, numComps do
+                local ciInfo = compInfo[i]
+                if ciInfo.pmf and ciInfo.countsPerVarPerK and ciInfo.total and
+                    ciInfo.total > 0 then
+                    local dpOthers = {}
+                    local pre = prefix[i - 1]
+                    local suf = suffix[i + 1]
+
+                    for ka, wa in pairs(pre) do
+                        for kb, wb in pairs(suf) do
+                            dpOthers[ka + kb] =
+                                (dpOthers[ka + kb] or 0) + wa * wb
+                        end
+                    end
+
+                    local G = {}
+                    for kThis = 0, #ciInfo.pmf do
+                        local s = 0.0
+                        for kOther, waysOther in pairs(dpOthers) do
+                            local t = remainingMines - (kThis + kOther)
+                            if t >= 0 and t <= outsideCovered then
+                                s = s + waysOther * combOutside[t]
+                            end
+                        end
+                        G[kThis] = s
+                    end
+
+                    local compCells = ciInfo.cells
+                    for j = 1, #compCells do
+                        local perK = ciInfo.countsPerVarPerK[j]
+                        local numerator = 0.0
+                        for kThis, waysCellAndK in pairs(perK) do
+                            numerator = numerator + waysCellAndK *
+                                            (G[kThis] or 0.0)
+                        end
+
+                        local p = numerator / totalGlobalWays
+                        data.cells.guess[compCells[j]] = p
+
+                        if p <= 1e-12 then
+                            if not knownClear[compCells[j]] then
+                                knownClear[compCells[j]] = true
+                                data.cells.toClear[compCells[j]] = true
+                            end
+                        elseif (1.0 - p) <= 1e-12 then
+                            if not knownFlag[compCells[j]] then
+                                knownFlag[compCells[j]] = true
+                                data.cells.toFlag[compCells[j]] = true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local accum = {}
+    for i = 1, #data.cells.numbered do
+        local numCell = data.cells.numbered[i]
+        local nUnknowns, flaggedCount = getUnknownsInto(numCell, knownFlag,
+                                                        knownClear, tmpUnknowns,
+                                                        trustExternal)
+        local remaining = (numCell.number or 0) - flaggedCount
+
+        if remaining > 0 and nUnknowns > 0 then
+            local p_each = remaining / nUnknowns
+            local tight = 1.0 -
+                              (min(remaining, nUnknowns - remaining) /
+                                  max(nUnknowns, 1))
+
+            for u = 1, nUnknowns do
+                local c = tmpUnknowns[u]
+                if not knownFlag[c] and not knownClear[c] then
+                    local e = accum[c]
+                    if not e then
+                        e = {
+                            n = 0,
+                            pList = {},
+                            tList = {},
+                            maxP = 0,
+                            minP = 1,
+                            prodSafe = 1.0
+                        }
+                        accum[c] = e
+                    end
+                    e.n = e.n + 1
+                    e.pList[e.n] = p_each
+                    e.tList[e.n] = tight
+                    if p_each > e.maxP then e.maxP = p_each end
+                    if p_each < e.minP then e.minP = p_each end
+                    e.prodSafe = e.prodSafe * (1.0 - p_each)
+                end
+            end
+        end
+    end
+
+    for cell, e in pairs(accum) do
+        if not knownFlag[cell] and not knownClear[cell] and
+            not data.cells.guess[cell] then
+            if e.n == 1 then
+                data.cells.guess[cell] = e.pList[1]
+            else
+                local pNoisyOr = 1.0 - e.prodSafe
+                local wSum, tSum = 0, 0
+
+                for i = 1, e.n do
+                    local w = e.tList[i] + 0.1
+                    wSum = wSum + e.pList[i] * w
+                    tSum = tSum + w
+                end
+
+                local pWeighted = wSum / tSum
+                local combined
+
+                if pNoisyOr >= 0.5 and pWeighted >= 0.5 then
+                    combined = max(pNoisyOr, pWeighted)
+                elseif pNoisyOr <= 0.5 and pWeighted <= 0.5 then
+                    combined = min(pNoisyOr, pWeighted)
+                else
+                    combined = pWeighted
+                end
+
+                data.cells.guess[cell] = combined
+            end
+        end
+    end
+
+    for cell, _ in pairs(data.cells.toFlag) do
+        data.cells.toClear[cell] = nil
+        data.cells.guess[cell] = nil
+    end
+    for cell, _ in pairs(data.cells.toClear) do
+        data.cells.toFlag[cell] = nil
+        data.cells.guess[cell] = nil
+    end
+
+    if data.debug and t0 ~= 0 then
+        local t1 =
+            (utility and utility.GetTickCount and utility.GetTickCount()) or 0
+        data.debug.planMs = (t1 ~= 0) and (t1 - t0) or 0
+    end
+end
+
+-- Rendering
+
+local function cellToScreen(cell)
+    local pos
+    if cell.part and cell.part.Position then
+        pos = cell.part.Position
+    else
+        pos = cell.pos
+    end
+    if not pos then return nil, nil end
+    if not utility or not utility.WorldToScreen then return nil, nil end
+
+    local sx, sy, onScreen = utility.WorldToScreen(pos)
+    if not onScreen then return nil, nil end
+
+    sx = floor(sx + 0.5)
+    sy = floor(sy + 0.5)
+    return sx, sy
+end
+
+local function fmtPct(p)
+    local q = floor(p * 20 + 0.5) / 20
+    return string.format("%d%%", floor(q * 100 + 0.5))
+end
+
+local function paint()
+    if data.ui.drawNumbers then
+        for _, cell in ipairs(data.cells.numbered) do
+            local sx, sy = cellToScreen(cell)
+            if sx and sy then
+                local col = NUM_COLORS[cell.number or 0] or COL_YELLOW
+                draw.TextOutlined(tostring(cell.number or "?"), sx, sy, col)
+            end
+        end
+    end
+
+    if data.ui.drawFlags then
+        for cell, _ in pairs(data.cells.toFlag or {}) do
+            local sx, sy = cellToScreen(cell)
+            if sx and sy then
+                draw.TextOutlined("F", sx, sy, COL_FLAG)
+            end
+        end
+    end
+
+    if data.ui.drawClears then
+        for cell, _ in pairs(data.cells.toClear or {}) do
+            local sx, sy = cellToScreen(cell)
+            if sx and sy then
+                draw.TextOutlined("O", sx, sy, COL_CLEAR)
+            end
+        end
+    end
+
+    if data.ui.drawGuesses then
+        for cell, p in pairs(data.cells.guess or {}) do
+            local sx, sy = cellToScreen(cell)
+            if sx and sy then
+                if p >= data.ui.PROB_FLAG_THRESHOLD then
+                    draw.TextOutlined("X", sx, sy, COL_GUESS_HIGH)
+                    draw.TextOutlined(fmtPct(p), sx + 10, sy - 10,
+                                      COL_GUESS_HIGH_PCT)
+                elseif p <= data.ui.PROB_SAFE_THRESHOLD then
+                    draw.TextOutlined("O?", sx, sy, COL_GUESS_SAFE)
+                    draw.TextOutlined(fmtPct(1 - p), sx + 10, sy - 10,
+                                      COL_GUESS_SAFE_PCT)
+                else
+                    draw.TextOutlined("F?", sx, sy, COL_GUESS_OTHER)
+                    draw.TextOutlined(fmtPct(p), sx + 10, sy - 10,
+                                      COL_GUESS_OTHER_PCT)
+                end
+            end
+        end
+    end
+
+    if data.debug and data.debug.enabled then
+        local x, y = 20, 40
+        draw.TextOutlined("Frontier: " .. tostring(data.debug.frontier), x, y,
+                          COL_YELLOW);
+        y = y + 14
+        draw.TextOutlined(
+            "Comps: " .. tostring(data.debug.comps) .. "  Max: " ..
+                tostring(data.debug.maxComp), x, y, COL_YELLOW);
+        y = y + 14
+        draw.TextOutlined("Enum: " .. tostring(data.debug.enumerated) ..
+                              "  Skip: " .. tostring(data.debug.skipped), x, y,
+                          COL_YELLOW);
+        y = y + 14
+        draw.TextOutlined("Plan ms: " .. tostring(data.debug.planMs), x, y,
+                          COL_YELLOW)
+    end
+end
+
+-- Board change detection + rebuild
+
+local function computePartsSignature(parts)
+    local n = #parts
+    if n == 0 then return "0" end
+
+    local step = math.max(1, floor(n / 12))
+    local acc = {tostring(n)}
+
+    local k = 1
+    for i = 1, n, step do
+        local p = parts[i]
+        local pos = p and p.Position
+        if pos then
+            local x = floor(pos.X * 10 + 0.5)
+            local z = floor(pos.Z * 10 + 0.5)
+            acc[#acc + 1] = tostring(x) .. "," .. tostring(z)
+        end
+        k = k + 1
+        if k > 12 then break end
+    end
+
+    return table.concat(acc, "|")
+end
+
+local function shouldRebuildGrid()
+    local root = game.Workspace:FindFirstChild("Flag")
+    if not root then return true end
+    local partsFolder = root:FindFirstChild("Parts")
+    if not partsFolder then return true end
+
+    local parts = partsFolder:GetChildren()
+    local n = #parts
+    local sig = computePartsSignature(parts)
+
+    if data.cache.partsFolder ~= partsFolder then
+        data.cache.partsFolder = partsFolder
+        data.cache.partsCount = n
+        data.cache.partsSig = sig
+        return true
+    end
+
+    if data.cache.partsCount ~= n then
+        data.cache.partsCount = n
+        data.cache.partsSig = sig
+        return true
+    end
+
+    if data.cache.partsSig ~= sig then
+        data.cache.partsSig = sig
+        return true
+    end
+
+    return false
+end
+
+local function forceFullRebuild()
+    data.cache.xs_centers_cached = nil
+    data.cache.zs_centers_cached = nil
+    data.grid.w, data.grid.h = 0, 0
+    data.cells.all = {}
+    data.cells.numbered = {}
+    data.cells.grid = {}
+    data.cells.list = {}
+    data.cache.epoch = 0
+    data.cache.lastEpochPlanned = -1
+end
+
+-- events
+
+cheat.register("onUpdate", function()
+    if shouldRebuildGrid() then forceFullRebuild() end
+
+    if not initGridIfNeeded() then return end
+
+    refreshGridState()
+
+    if data.cache.epoch ~= data.cache.lastEpochPlanned then
+        data.cache.lastEpochPlanned = data.cache.epoch
+        planMove()
+    end
+end)
+
+cheat.register("onSlowUpdate", function() updateUIData() end)
+
+cheat.register("onPaint", paint)
