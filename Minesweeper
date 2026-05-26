@@ -241,7 +241,7 @@ end
 
 local function enumerateCached(group, constraints, cap)
     local keys={}; for i=1,#group do keys[i]=group[i].k end; sort(keys)
-    local k=compKey(constraints)..#group.."|"..table.concat(keys,",")
+    local k=compKey(constraints).."|"..#group.."|"..table.concat(keys,",")
     local hit=ecacheGet(k)
     if hit then return hit.t,hit.h,hit.lo,hit.hi,hit.d,hit.pk,true,false end
     local t,h,lo,hi,d,pk,capped=enumerate(group,constraints,cap)
@@ -845,13 +845,15 @@ end
 
 local function hashParts(parts)
     local n=#parts; if n==0 then return "0" end
-    local step=math.max(1,floor(n/12)); local a={tostring(n)}; local k=1
-    for i=1,n,step do
+    local coords={}
+    for i=1,n do
         local p=parts[i]; local pos=p and p.Position
-        if pos then a[#a+1]=tostring(floor(pos.X*10+0.5))..","..tostring(floor(pos.Z*10+0.5)) end
-        k=k+1; if k>12 then break end
+        if pos then
+            coords[#coords+1]=tostring(floor(pos.X*10+0.5))..","..tostring(floor(pos.Z*10+0.5))
+        end
     end
-    return table.concat(a,"|")
+    sort(coords)
+    return tostring(n).."|"..table.concat(coords,"|")
 end
 
 local function needsRebuild()
@@ -867,6 +869,7 @@ end
 local function fullReset()
     state.cx=nil; state.cz=nil; cols=0; rows=0
     board.cells={}; board.revealed={}; board.rows={}; board.flat={}
+    board.flagged={}; board.cleared={}; board.probs={}
     state.tick=0; state.lastTick=-1
     ecacheClear()
 end
